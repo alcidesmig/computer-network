@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+import re
+
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+def sair(conexao):
+    for i in servidor.channels:
+        if conexao in servidor.channels[i]:
+            servidor.channels[i].remove(conexao)
+    if hasattr(conexao, 'channel'):
+        sent = []
+        for i in conexao.channel:
+            for j in servidor.channels[i]:
+                if j not in sent:
+                    sent.append(j)
+                    j.enviar(b':%s QUIT :Connection closed\r\n' % (conexao.nick))
+    if hasattr(conexao, 'nick'):
+        del servidor.nicks[conexao.nick.lower()]
+    conexao.fechar()
+
+def clean(x):
+    return x.replace(b'\n', b'').replace(b'\r', b'')
+
+def insert_nick(nick, connection):
+    servidor.nicks[nick.lower()] = connection
+    return
+
+def replace_nick(old, new, connection):
+    servidor.nicks[new.lower()] = connection 
+    del servidor.nicks[old.lower()]
+    return
+
+def nick_exists(nick):
+    return nick.lower() in servidor.nicks
+
+def send_priv8_msg(to, from_, msg):
+    # print(to[0], from_, msg)
+    if to[0] == 35: # 35 = #
+        # print("aqui")
+        if to.lower() in servidor.channels:
+            # print("existe")
+            for i in servidor.channels[to.lower()]:
+                # print("enviou para",)
+                if i.nick != from_:
+                    i.enviar(b':%s PRIVMSG %s :%s\r\n' % (from_, to, msg))
+    elif to.lower() in servidor.nicks:
+        servidor.nicks[to.lower()].enviar(b':%s PRIVMSG %s :%s\r\n' % (from_, to, msg))
+    return
+
+def join_channel(channel, connection):
+    # channel = channel[1:]
+    backup = channel
+    channel = channel.lower()
+    if not channel in servidor.channels:
+        servidor.channels[channel] = []
+    if connection not in servidor.channels[channel]:
+        servidor.channels[channel].append(connection)
+
+    if not hasattr(connection, 'channel'):
+        connection.channel = []
+
+    connection.channel.append(channel)
+
+    members = []
+    for i in servidor.channels[channel]:
+        i.enviar(b':%s JOIN :%s\r\n' % (connection.nick, backup))
+        members.append(i.nick)
+   # members.remove(connection.nick)
+    members = sorted(members)
+    # print('membros: ', members)
+    members_now = []
+    for i in members:
+        if 19 + len(b' '.join(members_now)) + len(i) > 510: # 512 with \r\n
+            connection.enviar(b':server 353 %s = %s :%s\r\n' % (connection.nick, backup, b' '.join(members_now)))
+            members_now = []
+        members_now.append(i)
+    if len(members) == 0:
+        connection.enviar(b':server 353 %s = %s :%s\r\n' % (connection.nick, backup, b''))
+    else:
+        connection.enviar(b':server 353 %s = %s :%s\r\n' % (connection.nick, backup, b' '.join(members_now)))
+    connection.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (connection.nick, backup))
+    return
+
+def leave_channel(channel, connection):
+    ch = servidor.channels[channel.lower()]
+    for i in ch:
+        i.enviar(b':%s PART %s\r\n' % (connection.nick, channel))
+    ch.remove(connection)
+    connection.channel.remove(channel)
+    return
+
+def resolve_residual_data(connection, data):
+    has_residual = hasattr(connection, 'residual_data')
+    if not b'\n' in data:
+        if not has_residual:
+            connection.residual_data = data
+        else:
+            connection.residual_data = connection.residual_data + data
+        return None
+    elif data[-1] != b'\n':
+        splitted = data.split(b'\n')
+        if has_residual:
+            residual_current = connection.residual_data 
+        connection.residual_data = splitted[-1]
+        if has_residual:
+            return (residual_current + b'\n'.join(splitted[:-1])).split(b'\n')
+        else:
+            return splitted[:-1]
+    else:
+        if has_residual:
+            # # print("Residual: ",(connection.residual_data + b'\n'.join(data.split(b'\n')[:-1])).split(b'\n'))
+            return (connection.residual_data + b'\n'.join(data.split(b'\n')[:-1])).split(b'\n')
+        else:
+            return data.split(b'\n')[:-1]
+
+def execute(connection, data):
+    spl_data = data.split(b' ')
+    cmd = spl_data[0]
+    if cmd == b'PING':
+        rest_of_msg = data.split(b' ', 1)[1]
+        connection.enviar(b':server PONG server :' + rest_of_msg + b'\n')
+        return
+    elif cmd == b'NICK':
+        rest_of_msg = clean(data.split(b' ', 1)[1])
+        if nick_exists(rest_of_msg):
+            if hasattr(connection, 'nick'):
+                connection.enviar(b':server 433 %s %s :Nickname is already in use\r\n' % (connection.nick, rest_of_msg))
+            else:
+                connection.enviar(b':server 433 * %s :Nickname is already in use\r\n' % (rest_of_msg))
+            return
+        if validar_nome(rest_of_msg):
+            if hasattr(connection, 'nick'):
+                replace_nick(connection.nick, rest_of_msg, connection)
+                connection.enviar(b':%s NICK %s\r\n' % (connection.nick, rest_of_msg))
+            else:
+                insert_nick(rest_of_msg, connection)
+                connection.enviar(b':server 001 %s :Welcome\r\n:server 422 %s :MOTD File is missing\r\n' % (rest_of_msg, rest_of_msg))
+            connection.nick = rest_of_msg
+            return
+        else:
+            if hasattr(connection, 'nick'):
+                connection.enviar(b':server 432 %s %s :Erroneous nickname\r\n' % (connection.nick, rest_of_msg))
+            else:
+                connection.enviar(b':server 432 * %s :Erroneous nickname\r\n' % (rest_of_msg))
+            return
+    elif cmd == b'PRIVMSG':
+        dest = spl_data[1]
+        rest_of_msg = clean(data.split(b':', 1)[1])
+        send_priv8_msg(dest, connection.nick, rest_of_msg)
+    elif cmd == b'JOIN':
+        rest_of_msg = clean(data.split(b' ', 1)[1])
+        # print(rest_of_msg, rest_of_msg[0])
+        if rest_of_msg[0] != 35 or not validar_nome(rest_of_msg[1:]):
+            connection.enviar(b':server 403 canal :No such channel\r\n')
+        else:
+            join_channel(rest_of_msg, connection)
+    elif cmd == b'PART':
+        rest_of_msg = clean(data.split(b' ')[1])
+        leave_channel(rest_of_msg, connection)
+
+def resolve_commands(connection, data):
+    if data == None:
+        return
+    for line in data:
+        execute(connection, line)
+
+def dados_recebidos(conexao, dados):
+    if dados == b'':
+        return sair(conexao)
+    # # print(dados)
+    data = resolve_residual_data(conexao, dados)
+    resolve_commands(conexao, data)
+
+    # print(conexao, dados)
+
+
+def conexao_aceita(conexao):
+    # print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+servidor.nicks = {}
+servidor.channels = {}
+asyncio.get_event_loop().run_forever()
